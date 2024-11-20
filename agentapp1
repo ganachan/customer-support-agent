@@ -1,0 +1,522 @@
+import streamlit as st
+import os
+import uuid
+from datetime import datetime, timezone, timedelta
+import time
+from io import StringIO
+from dotenv import load_dotenv
+import asyncio
+import json
+from pymongo import MongoClient
+import requests
+from openai import AzureOpenAI
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from semantic_kernel.agents import AgentGroupChat, ChatCompletionAgent
+from semantic_kernel.agents.strategies import KernelFunctionSelectionStrategy, KernelFunctionTerminationStrategy
+from semantic_kernel.connectors.ai.open_ai.services.azure_chat_completion import AzureChatCompletion
+from semantic_kernel.contents.chat_message_content import ChatMessageContent
+from semantic_kernel.contents.utils.author_role import AuthorRole
+from semantic_kernel.functions.kernel_function_from_prompt import KernelFunctionFromPrompt
+from semantic_kernel import Kernel
+
+# Load environment variables
+load_dotenv(override=True)
+
+# Azure and Cosmos DB configuration
+BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
+BLOB_CONTAINER_NAME = "uservideos"
+azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+api_version = "2024-02-01"
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+COSMOS_CONN_STR = os.getenv("AZCOSMOS_CONNSTR")
+COSMOS_DB_NAME = os.getenv("AZCOSMOS_DATABASE_NAME")
+COSMOS_CONTAINER_NAME = os.getenv("AZCOSMOS_CONTAINER_NAME")
+
+# Initialize Cosmos DB and Blob Storage clients
+client = MongoClient(COSMOS_CONN_STR)
+db = client[COSMOS_DB_NAME]
+collection = db[COSMOS_CONTAINER_NAME]
+blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+
+# Azure Cognitive Services Configuration
+SPEECH_ENDPOINT = "https://westus2.api.cognitive.microsoft.com"
+SUBSCRIPTION_KEY= ""
+API_VERSION = "2024-04-15-preview"
+background_image_url = "https://mariagana.blob.core.windows.net/uservideos/avatar_image3.jpg"
+
+# Initialize Azure OpenAI client
+client = AzureOpenAI(
+    api_key=api_key,
+    api_version=api_version,
+    azure_endpoint=azure_endpoint
+)
+
+# Initialize session state for history
+if 'video_history' not in st.session_state:
+    st.session_state['video_history'] = []
+
+# Streamlit Configuration
+st.set_page_config(layout="centered", page_title="Customer Support Agent", page_icon="🤖")
+
+# Function to fetch the latest case from Cosmos DB
+def fetch_latest_case():
+    latest_case = collection.find_one(sort=[("_id", -1)])
+    return convert_case_to_json(latest_case) if latest_case else None
+
+# Convert MongoDB document to JSON-serializable format
+def convert_case_to_json(case):
+    # Ensure required keys are present, or provide defaults if missing
+    case["_id"] = str(case["_id"])
+
+    # Use a default timestamp if 'Timestamp' is missing
+    timestamp = case.get("Timestamp", datetime.now())
+    case["Timestamp"] = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+
+    # Other fields with default values
+    case["Customer Name"] = case.get("Customer Name", "Unknown Customer")
+    case["Case Number"] = case.get("Case Number", "N/A")
+    case["Issue Description"] = case.get("Issue Description", "No issue description provided")
+    case["Issue Duration"] = case.get("Issue Duration", "Unknown duration")
+    case["Root Cause"] = case.get("Root Cause", "Root cause not specified")
+
+    return case
+# Save case details to Cosmos DB
+def write_to_cosmos_db(case_data):
+    try:
+        collection.delete_many({"Customer Name": case_data["Customer Name"]})
+        if "_id" in case_data:
+            del case_data["_id"]
+        collection.insert_one(case_data)
+        st.success("Case details saved to Cosmos DB successfully!")
+    except Exception as e:
+        st.error(f"Error saving to Cosmos DB: {e}")
+
+# Extract labels from transcript using OpenAI
+def extract_labels_with_openai(transcript):
+    prompt = (
+        "Extract the following details from the transcript below. "
+        "Respond ONLY in JSON format without any additional explanation. "
+        "Use this exact JSON structure:\n\n"
+        "{\n"
+        '  "Organization": "Organization name here",\n'
+        '  "Case Number": "Customer Case Number here",\n'
+        '  "Customer Name": "Customer name here",\n'
+        '  "Issue Description": "Brief description of the issue",\n'
+        '  "Issue Duration": "Duration the issue has been occurring",\n'
+        '  "Root Cause": "Suspected root cause if mentioned"\n'
+        "}\n\n"
+        "Transcript:\n"
+        f"{transcript}"
+    )
+
+    response = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={ "type": "json_object" },
+        max_tokens=500,
+        temperature=0.3,
+    )
+
+    content = response.choices[0].message.content
+    try:
+        labels = json.loads(content)
+    except json.JSONDecodeError:
+        st.error("The response is not in JSON format.")
+        labels = {}
+    return labels
+
+
+# Store prompt to Blob Storage
+def store_prompt_in_blob(prompt_text, filename):
+    blob_client = container_client.get_blob_client(blob=filename)
+    try:
+        blob_client.upload_blob(prompt_text, overwrite=True)
+        blob_url = blob_client.url
+        st.success(f"Prompt stored successfully! [Access it here]({blob_url})")
+        return blob_url
+    except Exception as e:
+        st.error(f"Error storing prompt in Blob Storage: {e}")
+
+
+def process_avatar_prompt_dynamically():
+    latest_case = fetch_latest_case()
+    if latest_case:
+        # Use 'Customer Name' as username from the latest case
+        username = latest_case.get("Customer Name", "Customer")
+        issue_description = latest_case.get("Issue Description", "an issue you're experiencing")
+        issue_duration = latest_case.get("Issue Duration", "an unspecified duration")
+        root_cause = latest_case.get("Root Cause", "We’re currently investigating the cause")
+        resolution = latest_case.get("Resolution", "Our technical team is actively working on a resolution for you.")
+
+        # Constructing a conversational, avatar-friendly prompt
+        prompt = (
+            f"Hello, {username}! I’m Maria, your dedicated support assistant from Microsoft. "
+            f"Thanks for reaching out to us—I’m here to assist you every step of the way.\n\n"
+            f"Let me walk you through a quick summary of your case.\n\n"
+            f"You've reported that {issue_description}. I understand this has been happening for about {issue_duration}, "
+            f"and it seems the root cause could be {root_cause}.\n\n"
+            f"Currently, we’re still working on a resolution for you. But please rest assured, our technical team is "
+            f"fully committed to resolving this as quickly as possible.\n\n"
+            f"Thank you for your patience, {username}. If there’s anything else you need or any questions you have, "
+            f"I’m here to help."
+        )
+
+        # Display the generated prompt
+        st.info(f"Avatar Prompt Generated:\n\n{prompt}")
+
+        # Define the filename and store the prompt in Blob Storage
+        prompt_filename = f"{username}_case_summary_prompt.txt"
+        store_prompt_in_blob(prompt, prompt_filename)
+
+    else:
+        st.warning("No cases found in Cosmos DB.")
+
+# Agent configurations
+MANAGER_NAME = "ManagerAgent"
+ANALYSIS_NAME = "AnalysisAgent"
+EXECUTOR_NAME = "ExecutorAgent"
+NOTIFICATION_NAME = "NotificationAgent"
+
+MANAGER_INSTRUCTIONS = """
+You are the Manager Agent. After receiving the analysis from the Analytics Agent,
+review the status and decide the next course of action. If the analysis is valid,
+instruct the Executor Agent to resolve the issue. Ensure the Notification Agent notifies stakeholders.
+"""
+
+ANALYSIS_INSTRUCTIONS = """
+You are the Analytics Agent. Your role is to analyze the issue thoroughly and provide
+a report to the Manager Agent with relevant insights. You are not responsible for resolving the issue.
+"""
+
+EXECUTOR_INSTRUCTIONS = """
+You are the Executor Agent. After receiving instructions from the Manager Agent,
+resolve the issue and report the status back to the Manager Agent. Ensure each resolution is marked
+as 'success' or 'failure' with proper follow-up if necessary.
+"""
+
+NOTIFICATION_INSTRUCTIONS = """
+You are the Notification Agent. Your task is to notify stakeholders with the status and details
+of the case after resolution and summarize the interactions.
+"""
+
+def _create_kernel_with_chat_completion(service_id: str) -> Kernel:
+    if not AZURE_DEPLOYMENT_NAME:
+        raise ValueError("AZURE_OPENAI_DEPLOYMENT_NAME is not defined")
+
+    kernel = Kernel()
+    kernel.add_service(
+        AzureChatCompletion(
+            endpoint=azure_endpoint,
+            service_id=service_id,
+            api_key=api_key,
+            deployment_name=AZURE_DEPLOYMENT_NAME,
+        )
+    )
+    return kernel
+
+# Define the agents
+agent_manager = ChatCompletionAgent(
+    service_id="ManagerAgent",
+    kernel=_create_kernel_with_chat_completion("ManagerAgent"),
+    name=MANAGER_NAME,
+    instructions=MANAGER_INSTRUCTIONS,
+)
+
+agent_analysis = ChatCompletionAgent(
+    service_id="AnalysisAgent",
+    kernel=_create_kernel_with_chat_completion("AnalysisAgent"),
+    name=ANALYSIS_NAME,
+    instructions=ANALYSIS_INSTRUCTIONS,
+)
+
+agent_executor = ChatCompletionAgent(
+    service_id="ExecutorAgent",
+    kernel=_create_kernel_with_chat_completion("ExecutorAgent"),
+    name=EXECUTOR_NAME,
+    instructions=EXECUTOR_INSTRUCTIONS,
+)
+
+agent_notification = ChatCompletionAgent(
+    service_id="NotificationAgent",
+    kernel=_create_kernel_with_chat_completion("NotificationAgent"),
+    name=NOTIFICATION_NAME,
+    instructions=NOTIFICATION_INSTRUCTIONS,
+)
+
+termination_function = KernelFunctionFromPrompt(
+    function_name="termination",
+    prompt="""
+    Determine if the recommendations have been approved by the manager.
+    If so, respond with a single word: approved
+
+    History:
+    {{$history}}
+    """,
+)
+
+selection_function = KernelFunctionFromPrompt(
+    function_name="selection",
+    prompt=f"""
+    Determine which participant takes the next turn based on the flow:
+    - After user input, {MANAGER_NAME} must respond.
+    - After {MANAGER_NAME}'s response, {ANALYSIS_NAME} should provide findings.
+    - Once findings are verified by {MANAGER_NAME}, {EXECUTOR_NAME} takes action.
+    - If {MANAGER_NAME} is satisfied with the resolution, {NOTIFICATION_NAME} generates a concise 50-word case summary and informs stakeholders.
+    - If the recommendations are insufficient, {MANAGER_NAME} generates a case summary and requests further action from {EXECUTOR_NAME}.
+
+    Participants:
+    - {MANAGER_NAME}
+    - {ANALYSIS_NAME}
+    - {EXECUTOR_NAME}
+    - {NOTIFICATION_NAME}
+
+    Based on the current history, which agent should respond next?
+    Provide only the name of the next participant.
+
+    History:
+    {{{{$history}}}}
+    """
+)
+
+# Real-time Agent Processing
+async def process_case(case_data, progress_area):
+    chat = AgentGroupChat(
+        agents=[agent_manager, agent_analysis, agent_executor, agent_notification],
+        termination_strategy=KernelFunctionTerminationStrategy(
+            agents=[agent_manager],
+            function=termination_function,
+            kernel=_create_kernel_with_chat_completion("termination"),
+            result_parser=lambda result: str(result.value[0]).lower() == "approved",
+            history_variable_name="history",
+            maximum_iterations=10,
+        ),
+        selection_strategy=KernelFunctionSelectionStrategy(
+            function=selection_function,
+            kernel=_create_kernel_with_chat_completion("selection"),
+            result_parser=lambda result: str(result.value[0]) if result.value else MANAGER_NAME,
+            agent_variable_name="agents",
+            history_variable_name="history",
+        ),
+    )
+
+    await chat.add_chat_message(ChatMessageContent(role=AuthorRole.USER, content=f"Processing Case: {json.dumps(case_data)}"))
+
+    try:
+        async for content in chat.invoke():
+            progress_area.write(f"{content.role} - {content.name or '*'}: {content.content}")
+    except Exception as e:
+        print(f"Agent Processing Error: {e}")
+
+# Streamlit UI
+st.markdown("<div class='title-section'><h1>Customer Support Case Agent 🤖</h1></div>", unsafe_allow_html=True)
+st.write("Upload or paste a transcript from a customer call, process it, and interact with agents.")
+
+uploaded_file = st.file_uploader("Upload Transcript", type=["txt"])
+text_input = st.text_area("Or Paste Transcript Here")
+
+if uploaded_file:
+    transcript = StringIO(uploaded_file.getvalue().decode("utf-8")).read()
+elif text_input:
+    transcript = text_input
+else:
+    transcript = None
+
+if transcript:
+    with st.spinner("Extracting information..."):
+        labels = extract_labels_with_openai(transcript)
+
+    st.markdown("<div class='label-section'><h3>Extracted Labels</h3></div>", unsafe_allow_html=True)
+    if labels:
+        for label, value in labels.items():
+            st.write(f"**{label}:** {value}")
+
+    if st.button("Save Case Details"):
+        case_data = {
+            "Case Number": labels.get("Case Number", "N/A"),
+            "Organization": labels.get("Organization", "N/A"),
+            "Timestamp": datetime.now(),
+            "Customer Name": labels.get("Customer Name", "N/A"),
+            "Issue Description": labels.get("Issue Description", "N/A"),
+            "Issue Duration": labels.get("Issue Duration", "N/A"),
+            "Root Cause": labels.get("Root Cause", "N/A")
+        }
+        write_to_cosmos_db(case_data)
+
+# Define a Streamlit session state to track case processing
+if 'case_processed' not in st.session_state:
+    st.session_state['case_processed'] = False
+
+# Button to process the latest case
+if st.button("Process Latest Case", key="process_case_button"):
+    latest_case = fetch_latest_case()
+    if latest_case:
+        st.write("Latest Case Retrieved:")
+        st.json(latest_case)
+
+        progress_area = st.empty()
+        asyncio.run(process_case(latest_case, progress_area))
+
+        st.session_state['case_processed'] = True
+    else:
+        st.warning("No cases found in Cosmos DB.")
+        st.session_state['case_processed'] = False
+
+# Button to generate avatar prompt, only enabled if case has been processed
+if st.session_state['case_processed']:
+    if st.button("Generate Avatar Prompt", key="generate_avatar_prompt"):
+        process_avatar_prompt_dynamically()
+        st.session_state['case_processed'] = False
+else:
+    st.info("Please process the latest case before generating the avatar prompt.")
+
+# Initialize Blob Storage client
+blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+
+# Functions for avatar synthesis and blob storage
+
+def _create_job_id():
+    return str(uuid.uuid4())
+
+def _authenticate(subscription_key):
+    return {'Ocp-Apim-Subscription-Key': subscription_key}
+
+def store_prompt_and_send_to_avatar(prompt_text, filename):
+    """Store the prompt in Blob Storage and send it to the avatar synthesis API."""
+    # Store prompt in Blob Storage
+    blob_client = container_client.get_blob_client(blob=filename)
+    try:
+        blob_client.upload_blob(prompt_text, overwrite=True)
+        blob_url = blob_client.url
+        st.success(f"Prompt stored successfully in Blob Storage. [Access it here]({blob_url})")
+    except Exception as e:
+        st.error(f"Error storing prompt in Blob Storage: {e}")
+        return None
+
+    # Submit to avatar synthesis
+    job_id = _create_job_id()
+    if submit_synthesis(job_id, prompt_text):
+        st.success("Avatar synthesis job submitted successfully.")
+        # Periodically check the synthesis job status and display the video
+        with st.spinner("Waiting for synthesis job to complete..."):
+            video_url = None
+            while not video_url:
+                video_url = get_synthesis(job_id)
+                if not video_url:
+                    #st.success("Avatar video generated successfully!")
+                    #display_video_with_download_option(video_url)
+                    time.sleep(5)
+
+             # Display the generated video with a download option after it completes
+            st.success("Avatar video generated successfully!")
+            display_video_with_download_option(video_url)
+
+            #    else:
+            #       st.warning("Processing... checking status again.")
+
+def submit_synthesis(job_id: str, input_text: str):
+    """Submit the prompt to custom avatar synthesis."""
+    url = f'{SPEECH_ENDPOINT}/avatar/batchsyntheses/{job_id}?api-version={API_VERSION}'
+    headers = {'Content-Type': 'application/json'}
+    headers.update(_authenticate(SUBSCRIPTION_KEY))
+
+    payload = {
+        'synthesisConfig': {
+            "voice": 'Marrie VoiceNeural',
+            "outputFormat": "riff-24khz-16bit-mono-pcm",
+            "wordBoundary": True
+        },
+        'customVoices': {
+            "Marrie VoiceNeural": "f173fead-5911-4129-9ada-e0c1e62903b1"
+        },
+        "inputKind": "plainText",
+        "inputs": [
+            {"content": input_text},
+        ],
+        "avatarConfig": {
+            "customized": True,
+            "talkingAvatarCharacter": 'Marrie-B',
+            "talkingAvatarStyle": 'Marrie-B-2',
+            "videoFormat": "mp4",
+            "videoCodec": "h264",
+            "subtitleType": "hard_embedded",
+            "backgroundColor": "#FFFFFFFF",
+            "backgroundImage": background_image_url
+        }
+    }
+
+    try:
+        response = requests.put(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()["id"]
+    except Exception as e:
+        st.error(f"Error submitting synthesis job: {e}")
+        return None
+
+def get_synthesis(job_id):
+    """Check the status of the synthesis job and get the video URL once it's complete."""
+    url = f'{SPEECH_ENDPOINT}/avatar/batchsyntheses/{job_id}?api-version=2024-04-15-preview'
+    headers = _authenticate(SUBSCRIPTION_KEY)
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        response_data = response.json()
+        if response_data['status'] == 'Succeeded':
+            video_url = response_data['outputs']['result']
+            return video_url
+        else:
+        # st.info("Job is still processing, please wait...")
+            return None
+    except Exception as e:
+        st.error(f"Error checking synthesis job: {e}")
+        return None
+
+def display_video_with_download_option(video_url):
+    """Display the video in the browser and provide a download link."""
+    # Inline video playback
+    st.markdown(
+        f"""
+        <video width="700" controls>
+            <source src="{video_url}" type="video/mp4">
+            Your browser does not support the video tag.
+        </video>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Download button
+    st.markdown(
+        f'<a href="{video_url}" download="avatar_video.mp4" style="color:white; background-color:blue; padding:10px; text-decoration:none;">Download Video</a>',
+        unsafe_allow_html=True
+    )
+
+# Function to display agent progress
+def display_agent_progress():
+    agents = [
+        ("ManagerAgent", "🔹 Manager Agent: Reviewing Case..."),
+        ("AnalysisAgent", "🔸 Analysis Agent: Analyzing Issue..."),
+        ("ExecutorAgent", "✅ Executor Agent: Resolving Issue..."),
+        ("NotificationAgent", "📣 Notification Agent: Notifying Stakeholders...")
+    ]
+
+# Streamlit UI to handle prompt submission
+st.title("🎥 Custom Avatar Video Generation")
+
+# Input area for the prompt text
+prompt_text = st.text_area("Enter the prompt for avatar synthesis:")
+
+# Button to store and send prompt
+if st.button("🎬 Generate Avatar Video from Custom Prompt"):
+    if prompt_text:
+        # Define the filename and store + send the prompt
+        prompt_filename = f"avatar_prompt_{_create_job_id()}.txt"
+        store_prompt_and_send_to_avatar(prompt_text, prompt_filename)
+    else:
+        st.warning("Please enter a prompt before submitting.")
